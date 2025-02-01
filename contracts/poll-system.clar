@@ -4,10 +4,14 @@
 (define-constant err-poll-not-ended (err u102))
 (define-constant err-already-voted (err u103))
 (define-constant err-invalid-option (err u104))
+(define-constant err-insufficient-stake (err u105))
+(define-constant err-rewards-claimed (err u106))
 
-;; Data Variables
+;; Data Variables 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var poll-count uint u0)
+(define-data-var min-stake-amount uint u100)
+(define-data-var reward-per-vote uint u10)
 
 ;; Data Maps
 (define-map polls
@@ -16,14 +20,17 @@
         question: (string-utf8 256),
         options: (list 10 (string-utf8 64)),
         votes: (list 10 uint),
+        weighted-votes: (list 10 uint),
         end-block: uint,
-        is-active: bool
+        is-active: bool,
+        total-stake: uint,
+        rewards-distributed: bool
     }
 )
 
 (define-map voter-registry
     { poll-id: uint, voter: principal }
-    bool
+    { voted: bool, stake-amount: uint, rewards-claimed: bool }
 )
 
 ;; Public Functions
@@ -39,8 +46,11 @@
                     question: question,
                     options: options,
                     votes: (list u0 u0 u0 u0 u0 u0 u0 u0 u0 u0),
+                    weighted-votes: (list u0 u0 u0 u0 u0 u0 u0 u0 u0 u0),
                     end-block: end-block,
-                    is-active: true
+                    is-active: true,
+                    total-stake: u0,
+                    rewards-distributed: false
                 })
                 (var-set poll-count (+ poll-id u1))
                 (ok poll-id)
@@ -50,7 +60,7 @@
     )
 )
 
-(define-public (cast-vote (poll-id uint) (option uint))
+(define-public (cast-weighted-vote (poll-id uint) (option uint) (stake-amount uint))
     (let
         (
             (poll (unwrap! (map-get? polls poll-id) err-invalid-option))
@@ -59,10 +69,33 @@
         (asserts! (>= (len (get options poll)) option) err-invalid-option)
         (asserts! (get is-active poll) err-poll-ended)
         (asserts! (< block-height (get end-block poll)) err-poll-ended)
-        (asserts! (not (default-to false (map-get? voter-registry vote-key))) err-already-voted)
+        (asserts! (not (default-to false (get voted (default-to { voted: false, stake-amount: u0, rewards-claimed: false } (map-get? voter-registry vote-key))))) err-already-voted)
+        (asserts! (>= stake-amount (var-get min-stake-amount)) err-insufficient-stake)
         
-        (map-set voter-registry vote-key true)
-        (ok (update-vote poll-id option))
+        (map-set voter-registry vote-key { voted: true, stake-amount: stake-amount, rewards-claimed: false })
+        (ok (update-weighted-vote poll-id option stake-amount))
+    )
+)
+
+(define-public (claim-voting-rewards (poll-id uint))
+    (let
+        (
+            (poll (unwrap! (map-get? polls poll-id) err-invalid-option))
+            (vote-info (unwrap! (map-get? voter-registry { poll-id: poll-id, voter: tx-sender }) err-invalid-option))
+        )
+        (asserts! (not (get is-active poll)) err-poll-not-ended)
+        (asserts! (not (get rewards-claimed vote-info)) err-rewards-claimed)
+        
+        (let
+            (
+                (reward (* (get stake-amount vote-info) (var-get reward-per-vote)))
+            )
+            (map-set voter-registry 
+                { poll-id: poll-id, voter: tx-sender }
+                (merge vote-info { rewards-claimed: true })
+            )
+            (ok reward)
+        )
     )
 )
 
@@ -78,14 +111,20 @@
 )
 
 ;; Private Functions
-(define-private (update-vote (poll-id uint) (option uint))
+(define-private (update-weighted-vote (poll-id uint) (option uint) (stake-amount uint))
     (let
         (
             (poll (unwrap-panic (map-get? polls poll-id)))
             (current-votes (get votes poll))
+            (current-weighted-votes (get weighted-votes poll))
             (updated-votes (replace-at-index current-votes option (+ (unwrap-panic (element-at current-votes option)) u1)))
+            (updated-weighted-votes (replace-at-index current-weighted-votes option (+ (unwrap-panic (element-at current-weighted-votes option)) stake-amount)))
         )
-        (map-set polls poll-id (merge poll { votes: updated-votes }))
+        (map-set polls poll-id (merge poll { 
+            votes: updated-votes,
+            weighted-votes: updated-weighted-votes,
+            total-stake: (+ (get total-stake poll) stake-amount)
+        }))
         true
     )
 )
@@ -114,6 +153,15 @@
     )
 )
 
-(define-read-only (has-voted (poll-id uint) (voter principal))
-    (default-to false (map-get? voter-registry { poll-id: poll-id, voter: voter }))
+(define-read-only (get-weighted-vote-count (poll-id uint) (option uint))
+    (let
+        (
+            (poll (unwrap! (map-get? polls poll-id) err-invalid-option))
+        )
+        (element-at (get weighted-votes poll) option)
+    )
+)
+
+(define-read-only (get-voter-info (poll-id uint) (voter principal))
+    (map-get? voter-registry { poll-id: poll-id, voter: voter })
 )
